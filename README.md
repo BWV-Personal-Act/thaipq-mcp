@@ -1,24 +1,24 @@
-# MCP File Organizer — demo cho bài techblog "MCP in Practice"
+# MCP File Organizer — demo for the techblog post "MCP in Practice"
 
-Demo minh họa MCP qua use case "AI File Organization Assistant": một MCP Server expose 2 tool quản lý file (`list_files`, `move_file` — không có `read_file`, server không bao giờ đọc nội dung bên trong file, chỉ dùng tên file/phần mở rộng/ngày sửa đổi), và một MCP Client/Agent dùng Gemini (qua `@google/genai`, hỗ trợ MCP có sẵn bằng `mcpToTool`) để tự chọn tool cần gọi dựa trên yêu cầu tự nhiên của người dùng. `folder` là đường dẫn tuyệt đối bất kỳ trên máy (không riêng gì `storage/inbox` của demo — có thể trỏ sang một thư mục thật như Downloads), kết quả luôn nằm trong `<folder>/organized/<phần mở rộng>/<năm>/<tháng>/<ngày>/`. Dataset demo là 500 file mock, tích lũy qua 365 ngày, tổ chức lại theo phần mở rộng rồi theo năm/tháng/ngày sửa đổi cuối.
+A demo illustrating MCP through the "AI File Organization Assistant" use case: an MCP Server exposing 2 file-management tools (`list_files`, `move_file` — no `read_file`; the server never reads file contents, only file name/extension/modification date), and an MCP Client/Agent using Gemini (via `@google/genai`, with built-in MCP support through `mcpToTool`) to decide which tool to call based on the user's natural-language request. `folder` is any absolute path on the machine (not limited to the demo's `storage/inbox` — it can point to a real folder such as Downloads), and results always land in `<folder>/organized/<extension>/<year>/<month>/<day>/`. The demo dataset is 500 mock files accumulated over 365 days, reorganized by extension and then by year/month/day of last modification.
 
-## Cài đặt
+## Setup
 
 ```bash
 npm install
 ```
 
-## Sinh dữ liệu mock
+## Generating mock data
 
 ```bash
-npm run generate-mock   # sinh 500 file mock vào storage/inbox, mtime rải rác trong 365 ngày gần nhất
+npm run generate-mock   # generates 500 mock files into storage/inbox, with mtimes spread across the last 365 days
 ```
 
-Chạy lại lệnh này để sinh một bộ dữ liệu mới bất kỳ lúc nào.
+Rerun this command anytime to generate a fresh dataset.
 
-## Chạy Agent thật (cần API key Gemini)
+## Running the real Agent (requires a Gemini API key)
 
-`client/client.ts` là Agent thật: gửi tên MCP client cho Gemini qua `mcpToTool`, để Gemini tự quyết định gọi tool nào với argument gì (automatic function calling), không hard-code rule nào. Đọc key từ `GEMINI_API_KEY`, hoặc `GOOGLE_API_KEY`, hoặc `API_KEY` (theo thứ tự ưu tiên đó); đọc model từ `MODEL` nếu giá trị bắt đầu bằng `gemini-`, ngược lại dùng mặc định `gemini-2.5-flash`.
+`client/client.ts` is the real Agent: it exposes the MCP client to Gemini via `mcpToTool`, letting Gemini decide on its own which tool to call and with what arguments (automatic function calling), with no hardcoded rules. It reads the key from `GEMINI_API_KEY`, or `GOOGLE_API_KEY`, or `API_KEY` (in that priority order); it reads the model from `MODEL` if the value starts with `gemini-`, otherwise it falls back to the default `gemini-2.5-flash`.
 
 ```bash
 # PowerShell
@@ -32,25 +32,25 @@ export GEMINI_API_KEY="AIza..."
 npm run agent
 ```
 
-Cũng có thể đặt các biến này trong file `.env` ở thư mục project; `npm run agent` tự nạp `.env` nếu file tồn tại (dùng flag `--env-file-if-exists` của Node).
+These variables can also be set in a `.env` file in the project directory; `npm run agent` automatically loads `.env` if it exists (using Node's `--env-file-if-exists` flag).
 
-Muốn thử trên một thư mục thật thay vì `storage/inbox`, truyền đường dẫn tuyệt đối làm argument, ví dụ `npm run agent -- "C:\Users\you\Downloads"`.
+To try it on a real folder instead of `storage/inbox`, pass an absolute path as an argument, e.g. `npm run agent -- "C:\Users\you\Downloads"`.
 
-## An toàn khi dùng với dữ liệu thật
+## Safety when using real data
 
-`server.ts` chặn sẵn vài trường hợp trước khi đụng tới filesystem:
+`server.ts` already guards against several cases before touching the filesystem:
 
-- `folder` phải là đường dẫn tuyệt đối — truyền tương đối bị từ chối ngay, không âm thầm resolve theo cwd của tiến trình server.
-- `name` phải là tên file trần (không chứa `/`, `\`, hay `..`) — chặn traversal ra ngoài `folder`.
-- `to_folder` được resolve rồi kiểm tra lại phải nằm trong `<folder>/organized/` — chặn traversal thoát ra ngoài qua `..`.
-- `move_file` từ chối nếu đích đã tồn tại (không âm thầm ghi đè); truyền `dry_run: true` để xem trước sẽ move gì mà không đụng file thật.
-- Đặt biến môi trường `ALLOWED_ROOTS` (danh sách đường dẫn tuyệt đối, phân tách bằng `;` trên Windows hoặc `:` trên Unix — theo `path.delimiter`) để giới hạn `folder` chỉ được nằm trong các gốc đó. Không đặt thì giữ hành vi gốc của demo: nhận bất kỳ thư mục tuyệt đối nào — phù hợp để demo nhưng nên đặt `ALLOWED_ROOTS` khi trỏ vào dữ liệu thật.
+- `folder` must be an absolute path — a relative path is rejected immediately, never silently resolved against the server process's cwd.
+- `name` must be a bare file name (no `/`, `\`, or `..`) — blocks traversal outside `folder`.
+- `to_folder` is resolved and then re-checked to ensure it stays within `<folder>/organized/` — blocks traversal outside via `..`.
+- `move_file` refuses if the destination already exists (never silently overwrites); pass `dry_run: true` to preview what would be moved without touching real files.
+- Set the `ALLOWED_ROOTS` environment variable (a list of absolute paths, delimited by `;` on Windows or `:` on Unix — following `path.delimiter`) to restrict `folder` to those roots only. If unset, the demo keeps its original behavior: accepting any absolute folder — fine for demo purposes, but `ALLOWED_ROOTS` should be set when pointing at real data.
 
-## Cấu trúc
+## Structure
 
 ```
-server/server.ts               MCP Server: list_files, move_file — folder là đường dẫn tuyệt đối bất kỳ, không đọc nội dung file
-client/generate-mock-inbox.ts  Sinh 500 file mock vào storage/inbox
-client/client.ts               MCP Client + Agent, dùng Gemini qua @google/genai
-storage/                       Sinh ra khi chạy generate-mock, không commit vào repo
+server/server.ts               MCP Server: list_files, move_file — folder is any absolute path, never reads file contents
+client/generate-mock-inbox.ts  Generates 500 mock files into storage/inbox
+client/client.ts               MCP Client + Agent, using Gemini via @google/genai
+storage/                       Generated by running generate-mock, not committed to the repo
 ```

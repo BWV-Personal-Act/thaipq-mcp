@@ -53,13 +53,55 @@ function assertPlainFileName(name: string, field: string): void {
   }
 }
 
+// Validates and performs a single move, throwing on any violation — move_files
+// catches this per-entry so one bad entry doesn't abort the rest of the batch.
+async function moveOneFile(root: string, name: string, to_folder: string, dry_run: boolean | undefined): Promise<string> {
+  assertPlainFileName(name, "name");
+
+  const organizedRoot = path.join(root, ORGANIZED_ROOT);
+  const sourcePath = path.resolve(root, name);
+  const targetDir = path.resolve(organizedRoot, to_folder);
+  const targetPath = path.join(targetDir, name);
+
+  if (!isInside(root, sourcePath)) {
+    throw new Error(`"name" escapes "${root}": resolved to "${sourcePath}"`);
+  }
+  if (!isInside(organizedRoot, targetPath)) {
+    throw new Error(`"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`);
+  }
+
+  const sourceStat = await fs.stat(sourcePath).catch(() => null);
+  if (!sourceStat) {
+    throw new Error(`Source not found: "${sourcePath}"`);
+  }
+  if (!sourceStat.isFile()) {
+    throw new Error(`"name" is a folder, not a file — refusing to move it: "${sourcePath}"`);
+  }
+
+  const destinationExists = await fs
+    .access(targetPath)
+    .then(() => true)
+    .catch(() => false);
+  if (destinationExists) {
+    throw new Error(`Destination already exists, refusing to overwrite: "${targetPath}"`);
+  }
+
+  if (dry_run) {
+    return `Dry run: would move "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
+  }
+
+  await fs.mkdir(targetDir, { recursive: true });
+  await fs.rename(sourcePath, targetPath);
+  return `Moved "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
+}
+
 const server = new McpServer({ name: "file-organizer", version: "1.0.0" });
 
 server.registerTool(
   "list_files",
   {
     description:
-      "Lists the files directly inside a folder (not recursive), including each file's last-modified date (modified) so it can be sorted by year/month/day. Only reads file names and metadata, never file content.",
+      "Lists the files directly inside a folder (not recursive) — subfolders are excluded, not descended into. Includes each file's last-modified date (modified) so it can be sorted by year/month/day. Only reads file names and metadata, never file content.",
     inputSchema: z.object({
       folder: z.string().describe("Absolute path to the folder to organize, e.g. 'C:\\Users\\you\\Downloads'"),
     }),
@@ -84,56 +126,38 @@ server.registerTool(
 );
 
 server.registerTool(
-  "move_file",
+  "move_files",
   {
     description:
-      `Moves a file from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder. Creates the destination if it doesn't exist. to_folder can be a nested path, e.g. 'pdf/2026/07/14', to organize files by type and then by year/month/day — every destination lands under ${ORGANIZED_ROOT}/, never loose inside the folder itself. Fails if the destination file already exists, instead of silently overwriting it. Set dry_run to preview the move without touching the filesystem.`,
+      `Moves one or more files from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder — pass a single-entry "moves" array to move just one file. Every entry is validated and moved independently: only plain files directly inside that folder are valid targets (a "name" that resolves to a subfolder, e.g. ${ORGANIZED_ROOT}/ itself, is rejected instead of moving the whole directory tree), and a destination that already exists is never overwritten. to_folder can be a nested path, e.g. 'pdf/2026/07/14', to organize files by type and then by year/month/day. A failing entry does not stop the rest of the batch — check each entry's "ok" field in the result to see which ones failed and why. Set dry_run to preview every move without touching the filesystem.`,
     inputSchema: z.object({
-      name: z.string().describe("Name of the file to move — a plain file name, not a path"),
       folder: z.string().describe("Absolute path to the folder being organized, e.g. 'C:\\Users\\you\\Downloads'"),
-      to_folder: z.string().describe(`Destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'`),
+      moves: z
+        .array(
+          z.object({
+            name: z.string().describe("Name of the file to move — a plain file name, not a path"),
+            to_folder: z.string().describe(`Destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'`),
+          }),
+        )
+        .min(1)
+        .describe("The files to move and where each one should go"),
       dry_run: z.boolean().optional().describe("If true, report what would happen without moving anything"),
     }),
   },
-  async ({ name, folder, to_folder, dry_run }) => {
+  async ({ folder, moves, dry_run }) => {
     const root = resolveFolder(folder);
-    assertPlainFileName(name, "name");
-
-    const organizedRoot = path.join(root, ORGANIZED_ROOT);
-    const sourcePath = path.resolve(root, name);
-    const targetDir = path.resolve(organizedRoot, to_folder);
-    const targetPath = path.join(targetDir, name);
-
-    if (!isInside(root, sourcePath)) {
-      throw new Error(`"name" escapes "${root}": resolved to "${sourcePath}"`);
+    const results: Array<{ name: string; to_folder: string; ok: boolean; message?: string; error?: string }> = [];
+    for (const { name, to_folder } of moves) {
+      try {
+        const message = await moveOneFile(root, name, to_folder, dry_run);
+        results.push({ name, to_folder, ok: true, message });
+      } catch (err) {
+        results.push({ name, to_folder, ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     }
-    if (!isInside(organizedRoot, targetPath)) {
-      throw new Error(`"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`);
-    }
-
-    const destinationExists = await fs
-      .access(targetPath)
-      .then(() => true)
-      .catch(() => false);
-    if (destinationExists) {
-      throw new Error(`Destination already exists, refusing to overwrite: "${targetPath}"`);
-    }
-
-    if (dry_run) {
-      return {
-        content: [
-          { type: "text", text: `Dry run: would move "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".` },
-        ],
-      };
-    }
-
-    await fs.mkdir(targetDir, { recursive: true });
-    await fs.rename(sourcePath, targetPath);
-    return {
-      content: [
-        { type: "text", text: `Moved "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".` },
-      ],
-    };
+    const movedCount = results.filter((r) => r.ok).length;
+    const summary = `${movedCount}/${results.length} file(s) ${dry_run ? "would be moved" : "moved"} successfully.`;
+    return { content: [{ type: "text", text: JSON.stringify({ summary, results }, null, 2) }] };
   },
 );
 

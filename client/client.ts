@@ -6,7 +6,7 @@ import path from "node:path";
 
 const DEFAULT_MODEL = "gemini-2.5-flash"; // Claude: "claude-sonnet-5" — Codex: "gpt-5-codex"
 const MODEL = process.env.MODEL?.toLowerCase().startsWith("gemini-") ? process.env.MODEL : DEFAULT_MODEL;
-const TOOL_CALL_BUFFER = 10; // slack for the model re-calling list_files or retrying move_file
+const TOOL_CALL_BUFFER = 10; // slack for the model re-calling list_files or retrying move_files
 
 const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY ?? process.env.API_KEY; // Claude: ANTHROPIC_API_KEY — Codex: OPENAI_API_KEY
 
@@ -17,8 +17,9 @@ const INBOX_DIR = process.argv[2]
   ? path.resolve(process.argv[2])
   : path.resolve(import.meta.dirname, "..", "storage", "inbox");
 
-// list_files is non-recursive and each file costs exactly one move_file call,
-// so count up front to size maximumRemoteCalls instead of hard-coding a number.
+// list_files is non-recursive; in the worst case (the model calls move_files once per
+// file instead of batching many files into one call) each file costs one tool call, so
+// size maximumRemoteCalls off that upper bound instead of hard-coding a number.
 const inboxEntries = await fs.readdir(INBOX_DIR, { withFileTypes: true });
 const fileCount = inboxEntries.filter((entry) => entry.isFile()).length;
 const MAX_TOOL_CALLS = fileCount + 1 + TOOL_CALL_BUFFER; // +1 for the list_files call
@@ -29,6 +30,9 @@ const serverPath = path.resolve(import.meta.dirname, "..", "server", "server.ts"
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: ["--import", "tsx", serverPath],
+  // StdioClientTransport only inherits a fixed safe allowlist (PATH, APPDATA, ...) by
+  // default — ALLOWED_ROOTS must be forwarded explicitly or server.ts never sees it.
+  env: { ALLOWED_ROOTS: process.env.ALLOWED_ROOTS ?? "" },
 });
 
 const mcpClient = new Client({ name: "file-organizer-agent", version: "1.0.0" });
@@ -43,7 +47,8 @@ const originalCallTool = mcpClient.callTool.bind(mcpClient);
 mcpClient.callTool = (async (params, options) => {
   callCount += 1;
   const args = params.arguments as Record<string, unknown>;
-  const label = params.name === "move_file" ? `${args.name} → ${args.to_folder}` : JSON.stringify(args);
+  const label =
+    params.name === "move_files" && Array.isArray(args.moves) ? `${args.moves.length} file(s)` : JSON.stringify(args);
   console.log(`[${callCount}] ${params.name}(${label})`);
   return originalCallTool(params, options);
 }) as typeof mcpClient.callTool;

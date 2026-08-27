@@ -39,7 +39,10 @@ function resolveFolder(folder: string): string {
     throw new Error(`"folder" must be an absolute path, got: "${folder}"`);
   }
   const resolved = path.resolve(folder);
-  if (ALLOWED_ROOTS.length > 0 && !ALLOWED_ROOTS.some((allowed) => isInside(allowed, resolved))) {
+  if (
+    ALLOWED_ROOTS.length > 0 &&
+    !ALLOWED_ROOTS.some((allowed) => isInside(allowed, resolved))
+  ) {
     throw new Error(`"folder" (${resolved}) is outside ALLOWED_ROOTS`);
   }
   return resolved;
@@ -48,14 +51,40 @@ function resolveFolder(folder: string): string {
 // "name" must be a plain file name — no path separators or ".." — so that
 // path.join(root, name) can never point outside `root`.
 function assertPlainFileName(name: string, field: string): void {
-  if (!name || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+  if (
+    !name ||
+    name.includes("/") ||
+    name.includes("\\") ||
+    name === "." ||
+    name === ".."
+  ) {
     throw new Error(`"${field}" must be a plain file name, got: "${name}"`);
+  }
+}
+
+function errorCodeOf(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+async function destinationExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.lstat(targetPath);
+    return true;
+  } catch (error) {
+    if (errorCodeOf(error) === "ENOENT") return false;
+    throw error;
   }
 }
 
 // Validates and performs a single move, throwing on any violation — move_files
 // catches this per-entry so one bad entry doesn't abort the rest of the batch.
-async function moveOneFile(root: string, name: string, to_folder: string, dry_run: boolean | undefined): Promise<string> {
+async function moveOneFile(
+  root: string,
+  name: string,
+  to_folder: string,
+  dry_run: boolean | undefined,
+): Promise<string> {
   assertPlainFileName(name, "name");
 
   const organizedRoot = path.join(root, ORGANIZED_ROOT);
@@ -67,31 +96,72 @@ async function moveOneFile(root: string, name: string, to_folder: string, dry_ru
     throw new Error(`"name" escapes "${root}": resolved to "${sourcePath}"`);
   }
   if (!isInside(organizedRoot, targetPath)) {
-    throw new Error(`"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`);
+    throw new Error(
+      `"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`,
+    );
   }
 
-  const sourceStat = await fs.stat(sourcePath).catch(() => null);
+  const sourceStat = await fs.stat(sourcePath).catch((error: unknown) => {
+    if (errorCodeOf(error) === "ENOENT") return null;
+    throw error;
+  });
   if (!sourceStat) {
     throw new Error(`Source not found: "${sourcePath}"`);
   }
   if (!sourceStat.isFile()) {
-    throw new Error(`"name" is a folder, not a file — refusing to move it: "${sourcePath}"`);
-  }
-
-  const destinationExists = await fs
-    .access(targetPath)
-    .then(() => true)
-    .catch(() => false);
-  if (destinationExists) {
-    throw new Error(`Destination already exists, refusing to overwrite: "${targetPath}"`);
+    throw new Error(
+      `"name" is a folder, not a file — refusing to move it: "${sourcePath}"`,
+    );
   }
 
   if (dry_run) {
+    if (await destinationExists(targetPath)) {
+      throw new Error(
+        `Destination already exists, refusing to overwrite: "${targetPath}"`,
+      );
+    }
     return `Dry run: would move "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
   }
 
   await fs.mkdir(targetDir, { recursive: true });
-  await fs.rename(sourcePath, targetPath);
+
+  // targetPath is nested under root, so a hard link gives us an atomic
+  // no-overwrite move on the same filesystem while preserving file metadata.
+  try {
+    await fs.link(sourcePath, targetPath);
+  } catch (error) {
+    const code = errorCodeOf(error);
+    if (code === "EEXIST") {
+      throw new Error(
+        `Destination already exists, refusing to overwrite: "${targetPath}"`,
+      );
+    }
+    if (code === "EXDEV" || code === "EPERM" || code === "ENOTSUP") {
+      throw new Error(
+        `Cannot move "${sourcePath}" without overwrite risk: the filesystem does not support the required hard link (${code}).`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    await fs.unlink(sourcePath);
+  } catch (unlinkError) {
+    try {
+      await fs.unlink(targetPath);
+    } catch (rollbackError) {
+      throw new Error(
+        `Created "${targetPath}" but could not remove "${sourcePath}" or roll back the destination; both paths may now exist. ` +
+          `Source error: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}. ` +
+          `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}.`,
+      );
+    }
+    throw new Error(
+      `Could not remove source after creating the destination link; the destination was rolled back: "${sourcePath}". ` +
+        `${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`,
+    );
+  }
+
   return `Moved "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
 }
 
@@ -103,7 +173,11 @@ server.registerTool(
     description:
       "Lists the files directly inside a folder (not recursive) — subfolders are excluded, not descended into. Includes each file's last-modified date (modified) so it can be sorted by year/month/day. Only reads file names and metadata, never file content.",
     inputSchema: z.object({
-      folder: z.string().describe("Absolute path to the folder to organize, e.g. 'C:\\Users\\you\\Downloads'"),
+      folder: z
+        .string()
+        .describe(
+          "Absolute path to the folder to organize, e.g. 'C:\\Users\\you\\Downloads'",
+        ),
     }),
   },
   async ({ folder }) => {
@@ -121,43 +195,74 @@ server.registerTool(
           };
         }),
     );
-    return { content: [{ type: "text", text: JSON.stringify(files, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify(files, null, 2) }],
+    };
   },
 );
 
 server.registerTool(
   "move_files",
   {
-    description:
-      `Moves one or more files from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder — pass a single-entry "moves" array to move just one file. Every entry is validated and moved independently: only plain files directly inside that folder are valid targets (a "name" that resolves to a subfolder, e.g. ${ORGANIZED_ROOT}/ itself, is rejected instead of moving the whole directory tree), and a destination that already exists is never overwritten. to_folder can be a nested path, e.g. 'pdf/2026/07/14', to organize files by type and then by year/month/day. A failing entry does not stop the rest of the batch — check each entry's "ok" field in the result to see which ones failed and why. Set dry_run to preview every move without touching the filesystem.`,
+    description: `Moves one or more files from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder — pass a single-entry "moves" array to move just one file. Every entry is validated and moved independently: only plain files directly inside that folder are valid targets (a "name" that resolves to a subfolder, e.g. ${ORGANIZED_ROOT}/ itself, is rejected instead of moving the whole directory tree), and a destination that already exists is never overwritten. to_folder can be a nested path, e.g. 'pdf/2026/07/14', to organize files by type and then by year/month/day. A failing entry does not stop the rest of the batch — check each entry's "ok" field in the result to see which ones failed and why. Set dry_run to preview every move without touching the filesystem.`,
     inputSchema: z.object({
-      folder: z.string().describe("Absolute path to the folder being organized, e.g. 'C:\\Users\\you\\Downloads'"),
+      folder: z
+        .string()
+        .describe(
+          "Absolute path to the folder being organized, e.g. 'C:\\Users\\you\\Downloads'",
+        ),
       moves: z
         .array(
           z.object({
-            name: z.string().describe("Name of the file to move — a plain file name, not a path"),
-            to_folder: z.string().describe(`Destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'`),
+            name: z
+              .string()
+              .describe(
+                "Name of the file to move — a plain file name, not a path",
+              ),
+            to_folder: z
+              .string()
+              .describe(
+                `Destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'`,
+              ),
           }),
         )
         .min(1)
         .describe("The files to move and where each one should go"),
-      dry_run: z.boolean().optional().describe("If true, report what would happen without moving anything"),
+      dry_run: z
+        .boolean()
+        .optional()
+        .describe("If true, report what would happen without moving anything"),
     }),
   },
   async ({ folder, moves, dry_run }) => {
     const root = resolveFolder(folder);
-    const results: Array<{ name: string; to_folder: string; ok: boolean; message?: string; error?: string }> = [];
+    const results: Array<{
+      name: string;
+      to_folder: string;
+      ok: boolean;
+      message?: string;
+      error?: string;
+    }> = [];
     for (const { name, to_folder } of moves) {
       try {
         const message = await moveOneFile(root, name, to_folder, dry_run);
         results.push({ name, to_folder, ok: true, message });
       } catch (err) {
-        results.push({ name, to_folder, ok: false, error: err instanceof Error ? err.message : String(err) });
+        results.push({
+          name,
+          to_folder,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     const movedCount = results.filter((r) => r.ok).length;
     const summary = `${movedCount}/${results.length} file(s) ${dry_run ? "would be moved" : "moved"} successfully.`;
-    return { content: [{ type: "text", text: JSON.stringify({ summary, results }, null, 2) }] };
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ summary, results }, null, 2) },
+      ],
+    };
   },
 );
 

@@ -6,6 +6,10 @@ import path from "node:path";
 
 const ORGANIZED_ROOT = "organized";
 
+// Bucket for files whose name carries no extension (e.g. "README", ".env"), so the
+// default scheme below always yields a valid first path segment.
+const NO_EXTENSION = "no-extension";
+
 // If ALLOWED_ROOTS is set (a list of absolute paths separated by path.delimiter),
 // "folder" must be inside one of them. Unset keeps the demo's original behavior:
 // accept any absolute folder.
@@ -22,6 +26,15 @@ function extensionOf(fileName: string): string {
 
 function isoDateOf(mtime: Date): string {
   return mtime.toISOString().slice(0, 10);
+}
+
+// Destination applied when the caller omits to_folder: <extension>/<year>/<month>/<day>.
+// The date comes from isoDateOf(mtime) — the same value list_files reports as
+// "modified" — so both tools always agree on which day a file belongs to.
+function defaultToFolder(fileName: string, mtime: Date): string {
+  const extension = extensionOf(fileName) || NO_EXTENSION;
+  const [year, month, day] = isoDateOf(mtime).split("-");
+  return `${extension}/${year}/${month}/${day}`;
 }
 
 // true if `child` is `parent` itself or nested inside it once both are resolved.
@@ -82,23 +95,16 @@ async function destinationExists(targetPath: string): Promise<boolean> {
 async function moveOneFile(
   root: string,
   name: string,
-  to_folder: string,
+  requestedToFolder: string | undefined,
   dry_run: boolean | undefined,
-): Promise<string> {
+): Promise<{ to_folder: string; message: string }> {
   assertPlainFileName(name, "name");
 
   const organizedRoot = path.join(root, ORGANIZED_ROOT);
   const sourcePath = path.resolve(root, name);
-  const targetDir = path.resolve(organizedRoot, to_folder);
-  const targetPath = path.join(targetDir, name);
 
   if (!isInside(root, sourcePath)) {
     throw new Error(`"name" escapes "${root}": resolved to "${sourcePath}"`);
-  }
-  if (!isInside(organizedRoot, targetPath)) {
-    throw new Error(
-      `"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`,
-    );
   }
 
   const sourceStat = await fs.stat(sourcePath).catch((error: unknown) => {
@@ -114,13 +120,29 @@ async function moveOneFile(
     );
   }
 
+  // The default scheme needs the file's mtime, so it is resolved only after the
+  // source is confirmed to be a real file. An explicit to_folder always wins.
+  const to_folder =
+    requestedToFolder ?? defaultToFolder(name, sourceStat.mtime);
+  const targetDir = path.resolve(organizedRoot, to_folder);
+  const targetPath = path.join(targetDir, name);
+
+  if (!isInside(organizedRoot, targetPath)) {
+    throw new Error(
+      `"to_folder" escapes "${organizedRoot}": resolved to "${targetPath}"`,
+    );
+  }
+
   if (dry_run) {
     if (await destinationExists(targetPath)) {
       throw new Error(
         `Destination already exists, refusing to overwrite: "${targetPath}"`,
       );
     }
-    return `Dry run: would move "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
+    return {
+      to_folder,
+      message: `Dry run: would move "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`,
+    };
   }
 
   await fs.mkdir(targetDir, { recursive: true });
@@ -162,7 +184,10 @@ async function moveOneFile(
     );
   }
 
-  return `Moved "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`;
+  return {
+    to_folder,
+    message: `Moved "${name}" to "${ORGANIZED_ROOT}/${to_folder}" inside "${root}".`,
+  };
 }
 
 const server = new McpServer({ name: "file-organizer", version: "1.0.0" });
@@ -171,7 +196,7 @@ server.registerTool(
   "list_files",
   {
     description:
-      "Lists the files directly inside a folder (not recursive) — subfolders are excluded, not descended into. Includes each file's last-modified date (modified) so it can be sorted by year/month/day. Only reads file names and metadata, never file content.",
+      "Lists the files directly inside a folder (not recursive) — subfolders are excluded, not descended into. Includes each file's last-modified date (modified) so it can be sorted by year/month/day; note that move_files derives that same date itself when to_folder is omitted, so it does not have to be passed along. Only reads file names and metadata, never file content.",
     inputSchema: z.object({
       folder: z
         .string()
@@ -204,7 +229,7 @@ server.registerTool(
 server.registerTool(
   "move_files",
   {
-    description: `Moves one or more files from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder — pass a single-entry "moves" array to move just one file. Every entry is validated and moved independently: only plain files directly inside that folder are valid targets (a "name" that resolves to a subfolder, e.g. ${ORGANIZED_ROOT}/ itself, is rejected instead of moving the whole directory tree), and a destination that already exists is never overwritten. to_folder can be a nested path, e.g. 'pdf/2026/07/14', to organize files by type and then by year/month/day. A failing entry does not stop the rest of the batch — check each entry's "ok" field in the result to see which ones failed and why. Set dry_run to preview every move without touching the filesystem.`,
+    description: `Moves one or more files from the folder being organized into a destination nested under ${ORGANIZED_ROOT}/ inside that same folder — pass a single-entry "moves" array to move just one file. Every entry is validated and moved independently: only plain files directly inside that folder are valid targets (a "name" that resolves to a subfolder, e.g. ${ORGANIZED_ROOT}/ itself, is rejected instead of moving the whole directory tree), and a destination that already exists is never overwritten. to_folder is optional and should normally be omitted: the server then applies the default scheme <extension>/<year>/<month>/<day>, taking the date from the file's own modification time (files with no extension go under ${NO_EXTENSION}/). Pass to_folder explicitly, e.g. 'pdf/2026/07/14', only when the request asks for a different layout. Each result entry reports the to_folder that was actually used. A failing entry does not stop the rest of the batch — check each entry's "ok" field in the result to see which ones failed and why. Set dry_run to preview every move without touching the filesystem.`,
     inputSchema: z.object({
       folder: z
         .string()
@@ -221,13 +246,16 @@ server.registerTool(
               ),
             to_folder: z
               .string()
+              .optional()
               .describe(
-                `Destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'`,
+                `Optional override for the destination path under ${ORGANIZED_ROOT}/, e.g. 'pdf/2026/07/14'. Omit it to use the default <extension>/<year>/<month>/<day> scheme derived from the file's modification date.`,
               ),
           }),
         )
         .min(1)
-        .describe("The files to move and where each one should go"),
+        .describe(
+          "The files to move. Give just the name of each file to use the default scheme; add to_folder only to override it.",
+        ),
       dry_run: z
         .boolean()
         .optional()
@@ -238,19 +266,28 @@ server.registerTool(
     const root = resolveFolder(folder);
     const results: Array<{
       name: string;
-      to_folder: string;
+      to_folder?: string;
       ok: boolean;
       message?: string;
       error?: string;
     }> = [];
     for (const { name, to_folder } of moves) {
       try {
-        const message = await moveOneFile(root, name, to_folder, dry_run);
-        results.push({ name, to_folder, ok: true, message });
-      } catch (err) {
+        const moved = await moveOneFile(root, name, to_folder, dry_run);
+        // Report the folder actually used, which for an omitted to_folder is the
+        // default scheme the server picked.
         results.push({
           name,
-          to_folder,
+          to_folder: moved.to_folder,
+          ok: true,
+          message: moved.message,
+        });
+      } catch (err) {
+        // On failure the default may never have been computed, so only echo back
+        // an explicitly requested to_folder.
+        results.push({
+          name,
+          ...(to_folder === undefined ? {} : { to_folder }),
           ok: false,
           error: err instanceof Error ? err.message : String(err),
         });

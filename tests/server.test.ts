@@ -8,7 +8,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 interface MoveEntryResult {
   name: string;
-  to_folder: string;
+  to_folder?: string;
   ok: boolean;
   message?: string;
   error?: string;
@@ -39,7 +39,7 @@ function parseToolText(result: unknown): unknown {
 async function callMoveFiles(
   client: Client,
   folder: string,
-  moves: Array<{ name: string; to_folder: string }>,
+  moves: Array<{ name: string; to_folder?: string }>,
   dry_run = false,
 ): Promise<MoveFilesResult> {
   const result = await client.callTool({
@@ -213,6 +213,175 @@ test("file-organizer MCP server", async (t) => {
         "source",
       );
     });
+
+    await t.test(
+      "applies the default extension/year/month/day when to_folder is omitted",
+      async () => {
+        const folder = path.join(allowedRoot, "default-scheme");
+        const sourcePath = path.join(folder, "invoice.PDF");
+        const modified = new Date("2026-03-09T15:30:00.000Z");
+        await fs.mkdir(folder);
+        await fs.writeFile(sourcePath, "invoice-content");
+        await fs.utimes(sourcePath, modified, modified);
+
+        const result = await callMoveFiles(client, folder, [
+          { name: "invoice.PDF" },
+        ]);
+
+        assert.equal(result.results[0]?.ok, true);
+        // The server reports the folder it picked, so the caller can see it.
+        assert.equal(result.results[0]?.to_folder, "pdf/2026/03/09");
+        assert.equal(
+          await fs.readFile(
+            path.join(
+              folder,
+              "organized",
+              "pdf",
+              "2026",
+              "03",
+              "09",
+              "invoice.PDF",
+            ),
+            "utf8",
+          ),
+          "invoice-content",
+        );
+        await assert.rejects(fs.access(sourcePath));
+      },
+    );
+
+    await t.test(
+      "the default date matches what list_files reports, across timezones",
+      async () => {
+        const folder = path.join(allowedRoot, "default-utc");
+        // 23:30 UTC is already the next day in +07:00 local time — the default has
+        // to follow list_files (UTC) or the two tools would disagree on the day.
+        const modified = new Date("2026-03-09T23:30:00.000Z");
+        await fs.mkdir(folder);
+        await fs.writeFile(path.join(folder, "late.csv"), "late");
+        await fs.utimes(path.join(folder, "late.csv"), modified, modified);
+
+        const listed = parseToolText(
+          await client.callTool({ name: "list_files", arguments: { folder } }),
+        ) as Array<{ name: string; modified: string }>;
+        const reportedDate = listed[0]?.modified ?? "";
+
+        const result = await callMoveFiles(client, folder, [
+          { name: "late.csv" },
+        ]);
+
+        assert.equal(reportedDate, "2026-03-09");
+        assert.equal(
+          result.results[0]?.to_folder,
+          `csv/${reportedDate.replaceAll("-", "/")}`,
+        );
+      },
+    );
+
+    await t.test("files without an extension get their own bucket", async () => {
+      const folder = path.join(allowedRoot, "no-extension");
+      const modified = new Date("2026-05-04T10:00:00.000Z");
+      await fs.mkdir(folder);
+      for (const name of ["README", ".env"]) {
+        await fs.writeFile(path.join(folder, name), name);
+        await fs.utimes(path.join(folder, name), modified, modified);
+      }
+
+      const result = await callMoveFiles(client, folder, [
+        { name: "README" },
+        { name: ".env" },
+      ]);
+
+      assert.deepEqual(
+        result.results.map(({ ok, to_folder }) => ({ ok, to_folder })),
+        [
+          { ok: true, to_folder: "no-extension/2026/05/04" },
+          { ok: true, to_folder: "no-extension/2026/05/04" },
+        ],
+      );
+      assert.equal(
+        await fs.readFile(
+          path.join(folder, "organized", "no-extension", "2026", "05", "04", "README"),
+          "utf8",
+        ),
+        "README",
+      );
+    });
+
+    await t.test("an explicit to_folder still overrides the default", async () => {
+      const folder = path.join(allowedRoot, "override");
+      const modified = new Date("2026-03-09T15:30:00.000Z");
+      await fs.mkdir(folder);
+      await fs.writeFile(path.join(folder, "note.txt"), "note");
+      await fs.utimes(path.join(folder, "note.txt"), modified, modified);
+
+      const result = await callMoveFiles(client, folder, [
+        { name: "note.txt", to_folder: "manual/bucket" },
+      ]);
+
+      assert.equal(result.results[0]?.ok, true);
+      assert.equal(result.results[0]?.to_folder, "manual/bucket");
+      assert.equal(
+        await fs.readFile(
+          path.join(folder, "organized", "manual", "bucket", "note.txt"),
+          "utf8",
+        ),
+        "note",
+      );
+      await assert.rejects(
+        fs.access(path.join(folder, "organized", "txt", "2026", "03", "09")),
+      );
+    });
+
+    await t.test(
+      "dry run with the default reports the folder without creating it",
+      async () => {
+        const folder = path.join(allowedRoot, "default-dry-run");
+        const modified = new Date("2026-07-14T08:00:00.000Z");
+        await fs.mkdir(folder);
+        await fs.writeFile(path.join(folder, "photo.jpg"), "photo");
+        await fs.utimes(path.join(folder, "photo.jpg"), modified, modified);
+
+        const result = await callMoveFiles(
+          client,
+          folder,
+          [{ name: "photo.jpg" }],
+          true,
+        );
+
+        assert.equal(result.results[0]?.ok, true);
+        assert.equal(result.results[0]?.to_folder, "jpg/2026/07/14");
+        assert.match(result.results[0]?.message ?? "", /^Dry run:/);
+        assert.equal(
+          await fs.readFile(path.join(folder, "photo.jpg"), "utf8"),
+          "photo",
+        );
+        await assert.rejects(fs.access(path.join(folder, "organized")));
+      },
+    );
+
+    await t.test(
+      "a failing entry without to_folder does not invent one",
+      async () => {
+        const folder = path.join(allowedRoot, "default-failure");
+        await fs.mkdir(path.join(folder, "subfolder"), { recursive: true });
+
+        const result = await callMoveFiles(client, folder, [
+          { name: "missing.txt" },
+          { name: "subfolder" },
+        ]);
+
+        assert.deepEqual(
+          result.results.map(({ ok, to_folder }) => ({ ok, to_folder })),
+          [
+            { ok: false, to_folder: undefined },
+            { ok: false, to_folder: undefined },
+          ],
+        );
+        assert.match(result.results[0]?.error ?? "", /Source not found/);
+        assert.match(result.results[1]?.error ?? "", /is a folder, not a file/);
+      },
+    );
   } finally {
     try {
       await client.close();
